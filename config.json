@@ -1,0 +1,9 @@
+{
+  "games": [
+    {
+      "name": "Example Game",
+      "folder": "ExampleGameFolder",
+      "exe": "ExampleGame.exe"
+    }
+  ]
+}
