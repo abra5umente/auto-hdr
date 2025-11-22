@@ -5,11 +5,17 @@ import os
 import subprocess
 import sys
 import logging
+import threading
+import pystray
+from PIL import Image, ImageDraw
+import winshell
+from win32com.client import Dispatch
 
 # Configuration
 CONFIG_FILE = 'config.json'
 HDR_CONTROLLER_SRC = 'hdr_controller.cs'
 HDR_CONTROLLER_EXE = 'hdr_controller.exe'
+APP_NAME = "Auto-HDR"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -29,14 +35,11 @@ def compile_hdr_controller():
         logging.error(f"Source file {HDR_CONTROLLER_SRC} not found.")
         return False
     
-    # Check if csc is in path
     try:
         subprocess.run(['csc', '/?'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
-        # Try to find csc in standard .NET locations
         dotnet_root = os.path.join(os.environ['WINDIR'], 'Microsoft.NET', 'Framework64')
         if os.path.exists(dotnet_root):
-            # Find the latest version
             versions = sorted([d for d in os.listdir(dotnet_root) if d.startswith('v4.')], reverse=True)
             if versions:
                 csc_path = os.path.join(dotnet_root, versions[0], 'csc.exe')
@@ -54,7 +57,6 @@ def compile_hdr_controller():
         logging.error("csc compiler not found. Please ensure .NET Framework is installed.")
         return False
 
-    # csc is in path
     cmd = ['csc', '/out:' + HDR_CONTROLLER_EXE, HDR_CONTROLLER_SRC]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode == 0:
@@ -70,9 +72,78 @@ def toggle_hdr(action):
         return
 
     logging.info(f"Toggling HDR: {action}")
-    subprocess.run([HDR_CONTROLLER_EXE, action])
+    # Use CREATE_NO_WINDOW to hide the console window of the subprocess
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    subprocess.run([HDR_CONTROLLER_EXE, action], startupinfo=startupinfo)
 
-def main():
+def create_image():
+    # Load the icon from file if it exists, otherwise generate fallback
+    icon_path = 'icon.png'
+    if os.path.exists(icon_path):
+        return Image.open(icon_path)
+    
+    # Generate an image for the system tray icon
+    width = 64
+    height = 64
+    color1 = "black"
+    color2 = "white"
+    image = Image.new('RGB', (width, height), color1)
+    dc = ImageDraw.Draw(image)
+    dc.rectangle((width // 2, 0, width, height // 2), fill=color2)
+    dc.rectangle((0, height // 2, width // 2, height), fill=color2)
+    return image
+
+def get_startup_path():
+    return os.path.join(winshell.startup(), f"{APP_NAME}.lnk")
+
+def is_startup_enabled(item):
+    return os.path.exists(get_startup_path())
+
+def toggle_startup(icon, item):
+    link_path = get_startup_path()
+    if os.path.exists(link_path):
+        try:
+            os.remove(link_path)
+            logging.info("Removed from startup")
+        except Exception as e:
+            logging.error(f"Failed to remove startup shortcut: {e}")
+    else:
+        try:
+            target = sys.executable
+            # If running as script, target pythonw and pass script path
+            # If frozen (exe), target executable
+            w_dir = os.getcwd()
+            args = ""
+            
+            if getattr(sys, 'frozen', False):
+                target = sys.executable
+            else:
+                # Use pythonw.exe to run without console
+                target = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+                script_path = os.path.abspath(__file__)
+                args = f'"{script_path}"'
+
+            shell = Dispatch('WScript.Shell')
+            shortcut = shell.CreateShortCut(link_path)
+            shortcut.Targetpath = target
+            shortcut.Arguments = args
+            shortcut.WorkingDirectory = w_dir
+            shortcut.IconLocation = target
+            shortcut.save()
+            logging.info("Added to startup")
+        except Exception as e:
+            logging.error(f"Failed to create startup shortcut: {e}")
+
+def on_quit(icon, item):
+    global stop_event
+    stop_event.set()
+    icon.stop()
+
+import pythoncom
+
+def monitor_loop(stop_event):
+    pythoncom.CoInitialize()
     config = load_config()
     if not config:
         return
@@ -83,39 +154,15 @@ def main():
             return
 
     c = wmi.WMI()
-    # watcher_start = c.Win32_ProcessStartTrace.watch()
-    # watcher_stop = c.Win32_ProcessStopTrace.watch()
-
-    # Track running games to avoid double toggling
-    # Key: pid, Value: game_name
-    running_games = {} 
+    active_hdr_game_pids = set()
 
     logging.info("Monitoring started...")
 
-    # We need to poll or use threads because we have two watchers. 
-    # Or we can just use a loop with timeout.
-    # WMI watchers are blocking by default.
-    # Let's use a simpler polling approach for now to keep it single threaded and robust,
-    # or just use one watcher for everything? No, they are different events.
-    # Actually, raw_wql query might be better for polling, but watch() is event driven.
-    # Let's use a loop that checks existing processes periodically + event listener?
-    # No, let's just use a simple polling loop for "Process exists" which is easier than maintaining state with events if we miss one.
-    # BUT the user asked for "monitors user-specified folders for application launches".
-    # Polling is safer.
-    
-    # Re-reading requirements: "when application launches... flip HDR ON... when that application exits... flip HDR off"
-    
-    active_hdr_game_pids = set()
-
-    while True:
+    while not stop_event.is_set():
         try:
-            # Reload config dynamically? Maybe not for now.
-            
-            # Get all running processes
-            current_processes = {} # pid -> name/path
+            current_processes = {}
             try:
                 procs = c.Win32_Process(['ProcessId', 'Name', 'ExecutablePath'])
-                # logging.info(f"Found {len(procs)} processes")
                 for p in procs:
                     if p.ProcessId and p.Name:
                         current_processes[p.ProcessId] = {
@@ -127,40 +174,28 @@ def main():
                 time.sleep(1)
                 continue
 
-            # Check for new matches
             matched_pids = set()
             
             for pid, p_info in current_processes.items():
                 p_name = p_info['name']
                 p_path = p_info['path']
                 
-                if not p_path: continue # System processes might not have path accessible
-
-                # logging.info(f"Checking {p_name} at {p_path}")
+                if not p_path: continue
 
                 for game in config['games']:
-                    # Check if exe matches
                     if game['exe'].lower() == p_name.lower():
-                        # Check if folder matches
-                        # Normalize paths
                         if game['folder'].lower() in p_path.lower():
                             matched_pids.add(pid)
                             
-                            # If this is a NEW match (not in our active set)
                             if pid not in active_hdr_game_pids:
                                 logging.info(f"Game detected: {game['name']} (PID: {pid})")
-                                # If this is the FIRST game, toggle HDR ON
                                 if not active_hdr_game_pids:
                                     toggle_hdr('on')
                                 active_hdr_game_pids.add(pid)
 
-            # Check for exits
-            # Identify PIDs that were active but are no longer running
             exited_pids = []
             for pid in list(active_hdr_game_pids):
                 if pid not in matched_pids:
-                    # Double check if it's really gone (sometimes WMI is slow?)
-                    # If it's not in current_processes, it's gone.
                     if pid not in current_processes:
                         logging.info(f"Game exited: PID {pid}")
                         exited_pids.append(pid)
@@ -168,18 +203,35 @@ def main():
             for pid in exited_pids:
                 active_hdr_game_pids.remove(pid)
             
-            # If no games are running anymore, toggle HDR OFF
             if exited_pids and not active_hdr_game_pids:
                  toggle_hdr('off')
 
-            time.sleep(2) # Poll every 2 seconds
+            time.sleep(2)
 
-        except KeyboardInterrupt:
-            logging.info("Exiting...")
-            break
         except Exception as e:
             logging.error(f"Unexpected error: {e}")
             time.sleep(1)
+
+stop_event = threading.Event()
+
+def main():
+    # Start monitor thread
+    t = threading.Thread(target=monitor_loop, args=(stop_event,))
+    t.daemon = True
+    t.start()
+
+    # Create tray icon
+    menu = pystray.Menu(
+        pystray.MenuItem("Start with Windows", toggle_startup, checked=is_startup_enabled),
+        pystray.MenuItem("Exit", on_quit)
+    )
+
+    icon = pystray.Icon("Auto-HDR", create_image(), "Auto-HDR", menu)
+    icon.run()
+
+    # Wait for thread to finish (if icon.run returns)
+    stop_event.set()
+    t.join()
 
 if __name__ == "__main__":
     main()

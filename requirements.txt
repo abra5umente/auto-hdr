@@ -1,2 +1,4 @@
 wmi
 pywin32
+pystray
+Pillow
